@@ -1,0 +1,9 @@
+.DS_Store
+Thumbs.db
+*.log
+android-wrapper/.gradle/
+android-wrapper/build/
+android-wrapper/app/build/
+android-wrapper/local.properties
+android-wrapper/*.iml
+android-wrapper/.idea/

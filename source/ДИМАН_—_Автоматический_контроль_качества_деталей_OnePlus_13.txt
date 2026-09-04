@@ -1,0 +1,1057 @@
+import React, { useState, useRef, useEffect } from 'react';
+import { 
+  Camera, Upload, AlertTriangle, CheckCircle2, RefreshCw, 
+  Crosshair, AlertOctagon, Check, Eye, Shield,
+  Layers, ZoomIn, ZoomOut, AlertCircle, Scale,
+  FileText, Activity, Zap, Plane, Gauge, FileCheck,
+  ShieldAlert, Sparkles, SlidersHorizontal, ArrowRight,
+  Maximize2, ChevronRight, Binary, Smartphone, FileSpreadsheet,
+  Compass, Award, Ruler, ShieldCheck, CheckCircle, Wrench, Factory,
+  Target, Focus, EyeOff, Scan, Cpu, Bot, TrendingDown, Radio,
+  ThumbsUp, Ban
+} from 'lucide-react';
+
+// API Key константа согласно стандарту среды выполнения
+const apiKey = "";
+
+// Классы шероховатости по ГОСТ 2789-73
+const ROUGHNESS_PRESETS = [
+  { value: "Ra 0.4", label: "Ra 0.4", desc: "Полирование / тонкое шлифование" },
+  { value: "Ra 0.8", label: "Ra 0.8", desc: "Чистовое шлифование" },
+  { value: "Ra 1.6", label: "Ra 1.6", desc: "Чистовое фрезерование ЧПУ" },
+  { value: "Ra 3.2", label: "Ra 3.2", desc: "Получистовая обработка (базовый стандарт)" },
+  { value: "Ra 6.3", label: "Ra 6.3", desc: "Черновое резание" },
+  { value: "Ra 12.5", label: "Ra 12.5", desc: "Заготовительный прокат" }
+];
+
+// Хэш снимка для детерминированности анализа
+function calculateQuickHash(str) {
+  let hash = 0;
+  for (let i = 0; i < Math.min(str.length, 6000); i++) {
+    const char = str.charCodeAt(i);
+    hash = ((hash << 5) - hash) + char;
+    hash |= 0;
+  }
+  return Math.abs(hash).toString(16).toUpperCase();
+}
+
+export default function App() {
+  const [selectedImage, setSelectedImage] = useState(null);
+  const [imagePayload, setImagePayload] = useState(null);
+  const [imageSignature, setImageSignature] = useState(null);
+  const [targetRoughness, setTargetRoughness] = useState("Ra 1.6");
+  const [isAutoMode, setIsAutoMode] = useState(true); // РЕЖИМ АВТО ПО УМОЛЧАНИЮ
+  const [isAnalyzing, setIsAnalyzing] = useState(false);
+  const [report, setReport] = useState(null);
+  const [errorMsg, setErrorMsg] = useState(null);
+  const [selectedDefectId, setSelectedDefectId] = useState(null);
+
+  // Навигация под OnePlus 13
+  const [activeTab, setActiveTab] = useState('verdict'); // 'verdict' | 'defects' | 'tolerance_map' | 'micro' | 'fmea' | 'gost'
+  const [defectFilter, setDefectFilter] = useState('all'); // 'all' | 'unacceptable' | 'conditional' | 'acceptable'
+  const [activeFilter, setActiveFilter] = useState('normal'); // 'normal' | 'contrast' | 'mono' | 'invert'
+  const [markerStyle, setMarkerStyle] = useState('hud'); // 'hud' | 'pin'
+  const [zoomLevel, setZoomLevel] = useState(1);
+  const [panOffset, setPanOffset] = useState({ x: 0, y: 0 });
+  const [showGrid, setShowGrid] = useState(false);
+
+  const fileInputRef = useRef(null);
+  const cameraInputRef = useRef(null);
+  const imageElementRef = useRef(null);
+  const viewportContainerRef = useRef(null);
+
+  // Haptic feedback для OnePlus
+  const triggerHaptic = (pattern = [15]) => {
+    if (typeof window !== 'undefined' && window.navigator && window.navigator.vibrate) {
+      try {
+        window.navigator.vibrate(pattern);
+      } catch (e) {}
+    }
+  };
+
+  // Обработка фото с нормализацией и автозапуском
+  const processImageFile = (file) => {
+    if (!file) return;
+    triggerHaptic([20]);
+
+    const reader = new FileReader();
+    reader.onerror = () => setErrorMsg("Ошибка считывания файла снимка.");
+    reader.onload = (event) => {
+      const img = new Image();
+      img.onerror = () => setErrorMsg("Не удалось декодировать изображение.");
+      img.onload = () => {
+        const maxDim = 1600;
+        let w = img.width;
+        let h = img.height;
+
+        if (w > maxDim || h > maxDim) {
+          if (w > h) {
+            h = Math.round((h * maxDim) / w);
+            w = maxDim;
+          } else {
+            w = Math.round((w * maxDim) / h);
+            h = maxDim;
+          }
+        }
+
+        const canvas = document.createElement('canvas');
+        canvas.width = w;
+        canvas.height = h;
+        const ctx = canvas.getContext('2d');
+        let dataUrl = event.target.result;
+        let base64 = String(event.target.result).split(',')[1];
+
+        if (ctx) {
+          ctx.drawImage(img, 0, 0, w, h);
+          dataUrl = canvas.toDataURL('image/jpeg', 0.90);
+          base64 = dataUrl.split(',')[1];
+        }
+
+        setSelectedImage(dataUrl);
+        const payload = { base64, mimeType: 'image/jpeg' };
+        setImagePayload(payload);
+        const sig = `${w}x${h}_${calculateQuickHash(base64)}`;
+        setImageSignature(sig);
+
+        setReport(null);
+        setErrorMsg(null);
+        setSelectedDefectId(null);
+        setZoomLevel(1);
+        setPanOffset({ x: 0, y: 0 });
+
+        // В РЕЖИМЕ АВТО — МОМЕНТАЛЬНЫЙ СТАРТ ЭКСПЕРТИЗЫ ПО ФОТО
+        if (isAutoMode) {
+          runDeepMetrologicalAudit(payload, sig, true);
+        }
+      };
+      img.src = event.target.result;
+    };
+    reader.readAsDataURL(file);
+  };
+
+  // Плавный фокус на дефекте
+  const focusOnDefect = (defect) => {
+    triggerHaptic([25]);
+    setSelectedDefectId(defect.id);
+    setZoomLevel(1.85);
+    const targetX = (50 - defect.box.cx) * 1.5;
+    const targetY = (50 - defect.box.cy) * 1.5;
+    setPanOffset({ x: Math.max(-50, Math.min(50, targetX)), y: Math.max(-50, Math.min(50, targetY)) });
+  };
+
+  const resetViewport = () => {
+    triggerHaptic([10]);
+    setZoomLevel(1);
+    setPanOffset({ x: 0, y: 0 });
+  };
+
+  // Запуск метрологического аудита (ручной или АВТО)
+  const runDeepMetrologicalAudit = async (customPayload = null, customSig = null, autoTriggered = false) => {
+    triggerHaptic([30, 40]);
+
+    const activeImagePayload = customPayload || imagePayload;
+    const activeSig = customSig || imageSignature;
+
+    if (!selectedImage && !activeImagePayload) {
+      setErrorMsg("Сделайте снимок детали на камеру OnePlus 13 или загрузите файл.");
+      return;
+    }
+
+    setIsAnalyzing(true);
+    setErrorMsg(null);
+    setSelectedDefectId(null);
+    resetViewport();
+
+    try {
+      const systemPrompt = `Ты — экспертная автоматизированная система оптико-электронного и метрологического неразрушающего контроля «ДИМАН» (Дефектоскопический Интеллектуальный Метрологический Анализатор Неразрушающего контроля) фирмы «Полёт».
+Квалификационный уровень: Главный государственный аудитор качества / Эксперт ВИК (VT Level III по ГОСТ Р 55724-2013, ГОСТ 23479-79, ГОСТ 15467-79, ГОСТ 2789-73, ГОСТ 21495-76, ГОСТ 2.307-2011, ГОСТ 24642-81, ГОСТ 9.301-86, ГОСТ В 15.307).
+
+РЕЖИМ: ${isAutoMode ? "АВТОНОМНЫЙ АВТОПИЛОТ (AUTO-PILOT NDT) — самостоятельное определение материала детали, квалитета точности, шероховатости чертежа и жестких допусков" : "РУЧНОЙ РЕЖИМ — сверка с заданной шероховатостью: " + targetRoughness}
+
+ОСНОВОПОЛАГАЮЩИЕ ПРИНЦИПЫ:
+1. АБСОЛЮТНЫЙ НУЛЕВОЙ ВЫМЫСЕЛ И СТРОГАЯ ДЕТЕРМИНИРОВАННОСТЬ:
+   - Анализируй физические пиксели: глубину рисок, периодичность гребешков, геометрию фасок, грат, пористость, зоны термического влияния.
+   - Запрещено придумывать скрытые дефекты. Анализируй только достоверно различимые оптические факты.
+   - Если деталь обработана качественно — ставь статус APPROVED и подтверждай соответствие.
+
+2. ЧЕТКИЙ УЧЕТ ДОПУСТИМОГО БРАКА И ИНТЕРЕСОВ ПРОИЗВОДСТВА (ГОСТ 15467-79):
+   - Разделяй все найденные отклонения строго по трем категориям:
+     * UNACCEPTABLE (Неисправимый брак): сквозные или развивающиеся трещины, прижоги закаленного слоя с потерей твердости, раковины в теле ответственных элементов, завалы базовых установочных поверхностей. Запрет серии (REJECTED).
+     * CONDITIONAL (Исправимый брак / Доработка в цехе): заусенцы на кромках, следы отвода инструмента, превышение шероховатости, устранимое повторным чистовым проходом или полировкой. Укажи ориентировочные нормо-минуты слесарки.
+     * ACCEPTABLE (Допустимый брак / Допустимые технологические отклонения): единичные микрориски глубиной менее 1/3 допуска на свободных поверхностях, допустимая технологическая шероховатость вне посадочных шеек, равномерный след резания по ГОСТ в пределах допуска. Эти дефекты НЕ бракуют деталь и являются допустимыми для запуска в серию.
+
+3. ПРЕЦИЗИОННЫЕ КООРДИНАТЫ (BOUNDING BOX):
+   - Для каждого дефекта и допустимого отклонения выдай рамку Bounding Box (cx, cy, w, h в процентах от 0 до 100), указывающую СТРОГО на физический оптический артефакт на теле детали.`;
+
+      const userPrompt = `Проведи полный, глубочайший визуально-оптический метрологический аудит детали на снимке для фирмы «Полёт».
+${isAutoMode ? "РЕЖИМ АВТО: самостоятельно определи конструкторскую норму чертежа, фактическую шероховатость Ra/Rz, материал, квалитет точности по ЕСДП и прогноз DPPM." : `Требуемая шероховатость по чертежу: ${targetRoughness}.`}
+Сигнатура кадра: ${activeSig || 'RAW_ONEPLUS'}.
+Удели особое внимание разделению дефектов: выдели ДОПУСТИМЫЙ БРАК (отклонения, не влияющие на работоспособность узла), ИСПРАВИМЫЙ БРАК (доработка в цехе) и НЕИСПРАВИМЫЙ БРАК. Дай развернутый FMEA-прогноз.`;
+
+      const payload = {
+        contents: [
+          {
+            role: "user",
+            parts: [
+              { text: userPrompt },
+              {
+                inlineData: {
+                  mimeType: activeImagePayload.mimeType,
+                  data: activeImagePayload.base64
+                }
+              }
+            ]
+          }
+        ],
+        systemInstruction: {
+          parts: [{ text: systemPrompt }]
+        },
+        generationConfig: {
+          temperature: 0.0, // Детерминированный режим
+          responseMimeType: "application/json",
+          responseSchema: {
+            type: "OBJECT",
+            properties: {
+              autoPilotMetrics: {
+                type: "OBJECT",
+                properties: {
+                  detectedProcessType: { type: "STRING", description: "Определенный техпроцесс (ЧПУ, точение, литье и т.д.)" },
+                  inferredAccuracyGrade: { type: "STRING", description: "Квалитет точности по ЕСДП (напр. 'IT7 - IT8')" },
+                  forecastDppm: { type: "INTEGER", description: "Прогнозируемый уровень дефектности (DPPM)" },
+                  recommendedInspectionCycleSec: { type: "INTEGER", description: "Рекомендуемый такт контроля в секундах" }
+                },
+                required: ["detectedProcessType", "inferredAccuracyGrade", "forecastDppm", "recommendedInspectionCycleSec"]
+              },
+              executiveVerdict: {
+                type: "OBJECT",
+                properties: {
+                  decision: { type: "STRING", enum: ["APPROVED", "CONDITIONAL", "REJECTED"] },
+                  overallScore: { type: "INTEGER", description: "Индекс соответствия качеству 0-100" },
+                  verdictTitle: { type: "STRING" },
+                  summaryConclusion: { type: "STRING" },
+                  shopfloorDecision: { type: "STRING" },
+                  toleranceAnalysisSummary: { type: "STRING", description: "Обоснование влияния допустимого брака на ресурс узла" },
+                  reworkEstimateMinutes: { type: "INTEGER" },
+                  unacceptableCount: { type: "INTEGER" },
+                  conditionalCount: { type: "INTEGER" },
+                  acceptableCount: { type: "INTEGER" }
+                },
+                required: ["decision", "overallScore", "verdictTitle", "summaryConclusion", "shopfloorDecision", "toleranceAnalysisSummary", "reworkEstimateMinutes", "unacceptableCount", "conditionalCount", "acceptableCount"]
+              },
+              inspectionProtocolMetadata: {
+                type: "OBJECT",
+                properties: {
+                  protocolNumber: { type: "STRING" },
+                  inspectionClass: { type: "STRING" },
+                  estimatedCpk: { type: "STRING" },
+                  opticalLightingEvaluation: { type: "STRING" }
+                },
+                required: ["protocolNumber", "inspectionClass", "estimatedCpk", "opticalLightingEvaluation"]
+              },
+              metrologicalPassport: {
+                type: "OBJECT",
+                properties: {
+                  identifiedPartType: { type: "STRING" },
+                  opticalMaterialEvidence: { type: "STRING" },
+                  roughnessAudit: {
+                    type: "OBJECT",
+                    properties: {
+                      drawingNorm: { type: "STRING" },
+                      measuredRaRange: { type: "STRING" },
+                      estimatedRz: { type: "STRING" },
+                      stepSm: { type: "STRING" },
+                      layDirection: { type: "STRING" },
+                      complianceStatus: { type: "STRING" }
+                    },
+                    required: ["drawingNorm", "measuredRaRange", "estimatedRz", "stepSm", "layDirection", "complianceStatus"]
+                  },
+                  formTolerancesGost24642: { type: "STRING" },
+                  basesAndMatingSurfaces: { type: "STRING" },
+                  edgesAndChamfers: { type: "STRING" },
+                  thermalAndSurfaceCondition: { type: "STRING" }
+                },
+                required: ["identifiedPartType", "opticalMaterialEvidence", "roughnessAudit", "formTolerancesGost24642", "basesAndMatingSurfaces", "edgesAndChamfers", "thermalAndSurfaceCondition"]
+              },
+              fmeaOperationalRisks: {
+                type: "ARRAY",
+                items: {
+                  type: "OBJECT",
+                  properties: {
+                    riskFactor: { type: "STRING" },
+                    riskLevel: { type: "STRING", enum: ["КРИТИЧЕСКИЙ", "ВЫСОКИЙ", "УМЕРЕННЫЙ", "НИЗКИЙ"] },
+                    impactDescription: { type: "STRING" },
+                    toleratedEffect: { type: "STRING" }
+                  },
+                  required: ["riskFactor", "riskLevel", "impactDescription", "toleratedEffect"]
+                }
+              },
+              gostStandardsMatrix: {
+                type: "ARRAY",
+                items: {
+                  type: "OBJECT",
+                  properties: {
+                    gostTitle: { type: "STRING" },
+                    scope: { type: "STRING" },
+                    compliance: { type: "STRING", enum: ["СООТВЕТСТВУЕТ", "УСЛОВНО-СООТВЕТСТВУЕТ", "НЕ СООТВЕТСТВУЕТ"] },
+                    opticalEvidence: { type: "STRING" }
+                  },
+                  required: ["gostTitle", "scope", "compliance", "opticalEvidence"]
+                }
+              },
+              detectedDefects: {
+                type: "ARRAY",
+                items: {
+                  type: "OBJECT",
+                  properties: {
+                    id: { type: "STRING" },
+                    defectName: { type: "STRING" },
+                    applicableGost: { type: "STRING" },
+                    admissibility: { type: "STRING", enum: ["UNACCEPTABLE", "CONDITIONAL", "ACCEPTABLE"] },
+                    admissibilityLabel: { type: "STRING" },
+                    isTolerableFlaw: { type: "BOOLEAN" },
+                    exactLocation: { type: "STRING" },
+                    physicalMorphology: { type: "STRING" },
+                    failureRisk: { type: "STRING" },
+                    shopfloorAction: { type: "STRING" },
+                    toleranceRationale: { type: "STRING" },
+                    box: {
+                      type: "OBJECT",
+                      properties: {
+                        cx: { type: "NUMBER" },
+                        cy: { type: "NUMBER" },
+                        w: { type: "NUMBER" },
+                        h: { type: "NUMBER" }
+                      },
+                      required: ["cx", "cy", "w", "h"]
+                    }
+                  },
+                  required: ["id", "defectName", "applicableGost", "admissibility", "admissibilityLabel", "isTolerableFlaw", "exactLocation", "physicalMorphology", "failureRisk", "shopfloorAction", "toleranceRationale", "box"]
+                }
+              }
+            },
+            required: [
+              "autoPilotMetrics", "executiveVerdict", "inspectionProtocolMetadata", 
+              "metrologicalPassport", "fmeaOperationalRisks", "gostStandardsMatrix", "detectedDefects"
+            ]
+          }
+        }
+      };
+
+      const delays = [1000, 2000, 4000, 8000];
+      let responseData = null;
+
+      for (let attempt = 0; attempt <= delays.length; attempt++) {
+        try {
+          const res = await fetch(
+            `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${apiKey}`,
+            {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(payload)
+            }
+          );
+
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+          const data = await res.json();
+          const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text;
+          if (!rawText) throw new Error("Пустой ответ оптического сканера");
+
+          responseData = JSON.parse(rawText);
+          break;
+        } catch (err) {
+          if (attempt === delays.length) throw new Error("Превышено время ожидания. Проверьте интернет на OnePlus.");
+          await new Promise(r => setTimeout(r, delays[attempt]));
+        }
+      }
+
+      if (responseData) {
+        setReport(responseData);
+        if (isAutoMode && responseData.metrologicalPassport?.roughnessAudit?.drawingNorm) {
+          const detectedNorm = responseData.metrologicalPassport.roughnessAudit.drawingNorm;
+          const matched = ROUGHNESS_PRESETS.find(p => detectedNorm.includes(p.value));
+          if (matched) setTargetRoughness(matched.value);
+        }
+        triggerHaptic([40, 60, 40]);
+      }
+    } catch (err) {
+      setErrorMsg(err.message || "Сбой при проведении метрологической экспертизы.");
+      triggerHaptic([60, 60]);
+    } finally {
+      setIsAnalyzing(false);
+    }
+  };
+
+  const filteredDefects = report?.detectedDefects?.filter(d => {
+    if (defectFilter === 'all') return true;
+    if (defectFilter === 'unacceptable') return d.admissibility === 'UNACCEPTABLE';
+    if (defectFilter === 'conditional') return d.admissibility === 'CONDITIONAL';
+    if (defectFilter === 'acceptable') return d.admissibility === 'ACCEPTABLE';
+    return true;
+  }) || [];
+
+  const getFilterClass = () => {
+    switch (activeFilter) {
+      case 'contrast': return 'contrast-150 brightness-95';
+      case 'invert': return 'invert hue-rotate-180 brightness-90';
+      case 'mono': return 'grayscale contrast-125';
+      default: return 'contrast-105';
+    }
+  };
+
+  return (
+    <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans select-none antialiased max-w-[440px] mx-auto shadow-2xl border-x border-slate-900">
+      
+      {/* Шапка OxygenOS с переключателем режима АВТО */}
+      <header className="sticky top-0 z-40 bg-slate-900/95 backdrop-blur-xl border-b border-cyan-500/20 px-3.5 py-2.5 flex items-center justify-between shadow-lg">
+        <div className="flex items-center gap-2.5">
+          <div className="w-8 h-8 rounded-xl bg-gradient-to-tr from-cyan-500 to-blue-600 p-0.5 flex items-center justify-center shadow-md shadow-cyan-500/30">
+            <div className="w-full h-full bg-slate-950 rounded-[9px] flex items-center justify-center">
+              <Plane className="w-4 h-4 text-cyan-400 stroke-[2.5]" />
+            </div>
+          </div>
+          <div>
+            <div className="flex items-center gap-1.5">
+              <h1 className="text-sm font-black tracking-tight text-white leading-none">ДИМАН</h1>
+              <span className="text-[9px] font-mono px-1.5 py-0.2 rounded bg-sky-500/20 text-sky-300 border border-sky-500/30 font-bold uppercase">
+                ПОЛЁТ
+              </span>
+            </div>
+            <p className="text-[9px] font-mono text-slate-400 mt-0.5 flex items-center gap-1">
+              <Smartphone className="w-2.5 h-2.5 text-cyan-400" />
+              OnePlus 13 • {isAutoMode ? "Режим АВТО" : "Ручной режим"}
+            </p>
+          </div>
+        </div>
+
+        {/* ТУМБЛЕР РЕЖИМА АВТО */}
+        <button
+          onClick={() => {
+            triggerHaptic([15]);
+            setIsAutoMode(!isAutoMode);
+          }}
+          className={`flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[10px] font-mono font-bold transition border ${
+            isAutoMode
+              ? 'bg-cyan-500/20 text-cyan-300 border-cyan-400/60 shadow-sm shadow-cyan-500/30'
+              : 'bg-slate-800 text-slate-400 border-slate-700'
+          }`}
+        >
+          <Bot className={`w-3.5 h-3.5 ${isAutoMode ? 'text-cyan-400 animate-pulse' : 'text-slate-500'}`} />
+          {isAutoMode ? "АВТО" : "РУЧНОЙ"}
+        </button>
+      </header>
+
+      {/* Основной контент */}
+      <main className="flex-1 flex flex-col p-3 gap-2.5 pb-28">
+
+        {/* Скрытые инпуты камеры */}
+        <input 
+          type="file" 
+          ref={cameraInputRef} 
+          onChange={(e) => processImageFile(e.target.files?.[0])} 
+          accept="image/*" 
+          capture="environment" 
+          className="hidden" 
+        />
+        <input 
+          type="file" 
+          ref={fileInputRef} 
+          onChange={(e) => processImageFile(e.target.files?.[0])} 
+          accept="image/*" 
+          className="hidden" 
+        />
+
+        {/* Баннер статуса режима АВТО или ручной селектор */}
+        {isAutoMode ? (
+          <div className="bg-gradient-to-r from-cyan-950/40 via-slate-900 to-blue-950/40 border border-cyan-500/30 rounded-xl p-2.5 shadow-sm flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <div className="w-6 h-6 rounded-lg bg-cyan-500/20 flex items-center justify-center">
+                <Radio className="w-3.5 h-3.5 text-cyan-400 animate-pulse" />
+              </div>
+              <div>
+                <span className="text-[11px] font-bold text-slate-100 block leading-tight">
+                  АВТООПРЕДЕЛЕНИЕ КАЧЕСТВА ДЕТАЛИ
+                </span>
+                <span className="text-[9px] text-slate-400 font-mono">
+                  Сделайте снимок — система сама определит Ra, квалитет и дефекты
+                </span>
+              </div>
+            </div>
+            <span className="text-[9px] font-mono px-2 py-0.5 rounded bg-cyan-500/20 text-cyan-300 font-bold border border-cyan-500/40">
+              ACTIVE
+            </span>
+          </div>
+        ) : (
+          <div className="bg-slate-900/90 border border-slate-800/90 rounded-xl p-2.5 shadow-sm animate-in fade-in duration-150">
+            <div className="flex items-center justify-between mb-1.5">
+              <span className="text-[11px] font-bold text-slate-200 flex items-center gap-1.5">
+                <Gauge className="w-3.5 h-3.5 text-cyan-400" />
+                Шероховатость чертежа (ГОСТ 2789-73):
+              </span>
+              <span className="text-[11px] font-mono font-bold text-cyan-300 bg-cyan-950/60 px-2 py-0.2 rounded border border-cyan-800/60">
+                {targetRoughness}
+              </span>
+            </div>
+
+            <div className="flex gap-1.5 overflow-x-auto pb-0.5 text-[10px] font-mono scrollbar-none">
+              {ROUGHNESS_PRESETS.map((opt) => (
+                <button
+                  key={opt.value}
+                  onClick={() => { triggerHaptic([10]); setTargetRoughness(opt.value); }}
+                  className={`px-2 py-1 rounded-lg border whitespace-nowrap transition active:scale-95 ${
+                    targetRoughness === opt.value
+                      ? 'bg-gradient-to-r from-cyan-500 to-blue-600 text-slate-950 font-black border-cyan-400 shadow-sm'
+                      : 'bg-slate-950 border-slate-800 text-slate-400 hover:border-slate-700'
+                  }`}
+                >
+                  {opt.label}
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* Видоискатель детали с прецизионными рамками */}
+        <div className="bg-slate-900 border border-slate-800 rounded-2xl overflow-hidden shadow-xl flex flex-col">
+          
+          <div className="bg-slate-950 px-2.5 py-1.5 border-b border-slate-800 flex items-center justify-between text-[11px]">
+            <div className="flex items-center gap-1">
+              <button 
+                onClick={() => { triggerHaptic([10]); setZoomLevel(prev => Math.min(prev + 0.25, 2.5)); }}
+                className="p-1 rounded-lg bg-slate-900 hover:bg-slate-800 text-slate-300 active:scale-90"
+                title="Приблизить"
+              >
+                <ZoomIn className="w-3.5 h-3.5" />
+              </button>
+              <button 
+                onClick={() => { triggerHaptic([10]); setZoomLevel(prev => Math.max(prev - 0.25, 1)); }}
+                className="p-1 rounded-lg bg-slate-900 hover:bg-slate-800 text-slate-300 active:scale-90"
+                title="Отдалить"
+              >
+                <ZoomOut className="w-3.5 h-3.5" />
+              </button>
+              <button 
+                onClick={resetViewport}
+                className="p-1 rounded-lg bg-slate-900 hover:bg-slate-800 text-slate-400 text-[10px] font-mono"
+                title="Сброс масштаба"
+              >
+                1:1
+              </button>
+              <button 
+                onClick={() => { triggerHaptic([10]); setShowGrid(!showGrid); }}
+                className={`p-1 rounded-lg transition ${showGrid ? 'bg-cyan-500/20 text-cyan-400' : 'bg-slate-900 text-slate-400'}`}
+                title="Координатная сетка"
+              >
+                <Layers className="w-3.5 h-3.5" />
+              </button>
+              <button 
+                onClick={() => { triggerHaptic([10]); setMarkerStyle(prev => prev === 'hud' ? 'pin' : 'hud'); }}
+                className={`p-1 rounded-lg text-[9px] font-mono transition ${markerStyle === 'hud' ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/40' : 'bg-slate-900 text-slate-400'}`}
+                title="Стиль рамок"
+              >
+                {markerStyle === 'hud' ? 'РАМКИ' : 'МЕТКИ'}
+              </button>
+            </div>
+
+            <div className="flex gap-1">
+              {[
+                { id: 'normal', label: 'Норм' },
+                { id: 'contrast', label: 'Контраст' },
+                { id: 'mono', label: 'Ч/Б' },
+                { id: 'invert', label: 'Инверс' }
+              ].map(f => (
+                <button
+                  key={f.id}
+                  onClick={() => { triggerHaptic([10]); setActiveFilter(f.id); }}
+                  className={`px-1.5 py-0.5 rounded-md text-[9px] font-mono transition ${
+                    activeFilter === f.id ? 'bg-cyan-400 text-slate-950 font-bold' : 'bg-slate-900 text-slate-400'
+                  }`}
+                >
+                  {f.label}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div 
+            ref={viewportContainerRef}
+            className="relative aspect-square w-full bg-slate-950 flex items-center justify-center overflow-hidden"
+          >
+            {selectedImage ? (
+              <div 
+                className="relative flex items-center justify-center transition-transform duration-200 ease-out"
+                style={{ 
+                  transform: `scale(${zoomLevel}) translate(${panOffset.x}%, ${panOffset.y}%)`,
+                  transformOrigin: 'center center'
+                }}
+              >
+                <img
+                  ref={imageElementRef}
+                  src={selectedImage}
+                  alt="Деталь"
+                  className={`max-h-[360px] max-w-[360px] object-contain block ${getFilterClass()}`}
+                />
+
+                {showGrid && (
+                  <div className="absolute inset-0 pointer-events-none bg-[linear-gradient(to_right,#06b6d420_1px,transparent_1px),linear-gradient(to_bottom,#06b6d420_1px,transparent_1px)] bg-[size:24px_24px] border border-cyan-500/30"></div>
+                )}
+
+                {/* Нанесение дефектов с Bounding Box */}
+                {report?.detectedDefects?.map((item, idx) => {
+                  const isSelected = selectedDefectId === item.id;
+                  const isUnacceptable = item.admissibility === 'UNACCEPTABLE';
+                  const isConditional = item.admissibility === 'CONDITIONAL';
+                  const box = item.box || { cx: 50, cy: 50, w: 10, h: 10 };
+
+                  const colorClass = isUnacceptable 
+                    ? 'border-rose-500 text-rose-400 bg-rose-500/20' 
+                    : isConditional 
+                    ? 'border-amber-500 text-amber-400 bg-amber-500/20' 
+                    : 'border-emerald-500 text-emerald-400 bg-emerald-500/20';
+
+                  return (
+                    <div
+                      key={item.id}
+                      onClick={() => focusOnDefect(item)}
+                      style={{
+                        position: 'absolute',
+                        left: `${box.cx}%`,
+                        top: `${box.cy}%`,
+                        width: markerStyle === 'hud' ? `${Math.max(box.w, 7)}%` : '20px',
+                        height: markerStyle === 'hud' ? `${Math.max(box.h, 7)}%` : '20px',
+                        transform: 'translate(-50%, -50%)',
+                        zIndex: isSelected ? 35 : 20
+                      }}
+                      className="cursor-pointer select-none transition-all duration-150"
+                    >
+                      {markerStyle === 'hud' ? (
+                        <div className={`w-full h-full relative border-2 ${colorClass} rounded-sm shadow-lg flex items-center justify-center transition-transform ${isSelected ? 'scale-110 ring-2 ring-white/80' : 'hover:scale-105'}`}>
+                          <div className="absolute -top-1 -left-1 w-1.5 h-1.5 border-t-2 border-l-2 border-white"></div>
+                          <div className="absolute -top-1 -right-1 w-1.5 h-1.5 border-t-2 border-r-2 border-white"></div>
+                          <div className="absolute -bottom-1 -left-1 w-1.5 h-1.5 border-b-2 border-l-2 border-white"></div>
+                          <div className="absolute -bottom-1 -right-1 w-1.5 h-1.5 border-b-2 border-r-2 border-white"></div>
+                          <div className="w-1.5 h-1.5 rounded-full bg-white shadow-sm"></div>
+                          <div className="absolute -top-4 left-0 bg-slate-950/90 text-white font-mono text-[8px] px-1 py-0.2 rounded border border-slate-700 shadow font-bold whitespace-nowrap">
+                            #{idx + 1} {item.isTolerableFlaw ? '[ДОПУСТИМО]' : item.defectName.slice(0, 9)}
+                          </div>
+                        </div>
+                      ) : (
+                        <div className="relative flex items-center justify-center w-full h-full">
+                          <span className={`animate-ping absolute inline-flex h-full w-full rounded-full opacity-70 ${isUnacceptable ? 'bg-rose-500' : isConditional ? 'bg-amber-500' : 'bg-emerald-500'}`} />
+                          <span className={`relative inline-flex rounded-full h-4 w-4 border-2 border-white items-center justify-center text-[8px] font-black text-white shadow-md ${
+                            isUnacceptable ? 'bg-rose-600' : isConditional ? 'bg-amber-600' : 'bg-emerald-600'
+                          }`}>
+                            {idx + 1}
+                          </span>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            ) : (
+              <div className="flex flex-col items-center justify-center text-center p-6 text-slate-500">
+                <Camera className="w-10 h-10 text-cyan-500/60 mb-2" />
+                <span className="text-xs font-bold text-slate-300">Деталь не загружена</span>
+                <span className="text-[10px] text-slate-500 mt-0.5">
+                  {isAutoMode ? "Сделайте снимок на камеру OnePlus 13 для автозапуска" : "Сделайте снимок или выберите файл из галереи"}
+                </span>
+              </div>
+            )}
+
+            {isAnalyzing && (
+              <div className="absolute inset-0 bg-slate-950/90 backdrop-blur-md flex flex-col items-center justify-center p-4 text-center z-30">
+                <RefreshCw className="w-10 h-10 text-cyan-400 animate-spin mb-3" />
+                <span className="text-xs font-mono font-bold text-cyan-300 uppercase tracking-widest">
+                  {isAutoMode ? "ДИМАН: Автоопределение качества..." : "ДИМАН: Глубокая экспертиза..."}
+                </span>
+                <span className="text-[10px] text-slate-400 mt-1">ОТК фирмы «Полёт» • Фильтрация допустимого брака</span>
+              </div>
+            )}
+
+            {/* Карточка выбранного дефекта */}
+            {selectedDefectId && report && (
+              (() => {
+                const item = report.detectedDefects.find(d => d.id === selectedDefectId);
+                if (!item) return null;
+                return (
+                  <div className="absolute bottom-2 inset-x-2 bg-slate-900/95 border border-cyan-500/50 p-2.5 rounded-xl shadow-2xl z-30 text-[11px] backdrop-blur max-h-52 overflow-y-auto">
+                    <div className="flex items-center justify-between font-bold text-white mb-1">
+                      <span className="flex items-center gap-1.5 text-cyan-400">
+                        <Focus className="w-3.5 h-3.5 text-cyan-400" />
+                        {item.defectName}
+                      </span>
+                      <button onClick={() => { setSelectedDefectId(null); resetViewport(); }} className="text-slate-400 p-0.5">✕</button>
+                    </div>
+                    <div className="text-[9px] font-mono mb-1 flex items-center justify-between">
+                      <span className="text-cyan-300">{item.applicableGost}</span>
+                      <span className={`font-bold ${
+                        item.admissibility === 'UNACCEPTABLE' ? 'text-rose-400' :
+                        item.admissibility === 'CONDITIONAL' ? 'text-amber-400' : 'text-emerald-400'
+                      }`}>
+                        {item.admissibilityLabel}
+                      </span>
+                    </div>
+                    <div className="text-slate-300">
+                      <span className="text-slate-400 font-medium">Зона:</span> {item.exactLocation}
+                    </div>
+                    <div className="text-slate-300 mt-0.5">
+                      <span className="text-slate-400 font-medium">Оптический признак:</span> {item.physicalMorphology}
+                    </div>
+                    <div className="text-slate-200 mt-1 p-1.5 bg-slate-950 rounded border border-slate-800 text-[10px]">
+                      <span className="text-cyan-400 font-bold block mb-0.5">Норма допуска:</span>
+                      {item.toleranceRationale}
+                    </div>
+                    <div className="text-emerald-400 mt-1 pt-1 border-t border-slate-800 text-[10px]">
+                      <span className="font-bold">Действие цеха:</span> {item.shopfloorAction}
+                    </div>
+                  </div>
+                );
+              })()
+            )}
+          </div>
+
+          <div className="p-2 bg-slate-900 border-t border-slate-800 grid grid-cols-2 gap-2">
+            <button
+              onClick={() => cameraInputRef.current?.click()}
+              className="py-2.5 px-3 rounded-xl bg-slate-800 active:bg-slate-700 text-slate-200 text-xs font-bold border border-slate-700 flex items-center justify-center gap-1.5 transition active:scale-95 shadow-sm"
+            >
+              <Camera className="w-4 h-4 text-cyan-400" />
+              Снимок камеры
+            </button>
+            <button
+              onClick={() => fileInputRef.current?.click()}
+              className="py-2.5 px-3 rounded-xl bg-slate-800 active:bg-slate-700 text-slate-200 text-xs font-bold border border-slate-700 flex items-center justify-center gap-1.5 transition active:scale-95 shadow-sm"
+            >
+              <Upload className="w-4 h-4 text-cyan-400" />
+              Из галереи
+            </button>
+          </div>
+        </div>
+
+        {imageSignature && (
+          <div className="text-[9px] font-mono text-slate-500 px-1 flex justify-between">
+            <span>Кадр: {imageSignature}</span>
+            <span>Режим: {isAutoMode ? "АВТО-ОТК" : "РУЧНОЙ"} (T=0.0)</span>
+          </div>
+        )}
+
+        {errorMsg && (
+          <div className="p-2.5 rounded-xl bg-rose-950/60 border border-rose-800 text-rose-300 text-[11px] flex items-center gap-2">
+            <AlertTriangle className="w-4 h-4 shrink-0 text-rose-400" />
+            <span>{errorMsg}</span>
+          </div>
+        )}
+
+        {/* РЕЗУЛЬТАТЫ ЭКСПЕРТИЗЫ */}
+        {report && (
+          <div className="flex flex-col gap-2.5 animate-in fade-in duration-200">
+            
+            {/* Карточка вердикта */}
+            <div className={`p-3.5 rounded-xl border ${
+              report.executiveVerdict.decision === 'APPROVED'
+                ? 'bg-slate-900 border-emerald-500/60 text-emerald-400'
+                : report.executiveVerdict.decision === 'CONDITIONAL'
+                ? 'bg-slate-900 border-amber-500/60 text-amber-400'
+                : 'bg-slate-900 border-rose-500/60 text-rose-400'
+            }`}>
+              <div className="flex items-center justify-between mb-1.5">
+                <div className="flex items-center gap-2">
+                  {report.executiveVerdict.decision === 'APPROVED' && <CheckCircle2 className="w-5 h-5 text-emerald-400" />}
+                  {report.executiveVerdict.decision === 'CONDITIONAL' && <AlertTriangle className="w-5 h-5 text-amber-400" />}
+                  {report.executiveVerdict.decision === 'REJECTED' && <AlertOctagon className="w-5 h-5 text-rose-400" />}
+                  
+                  <div>
+                    <span className="text-[9px] font-mono uppercase text-slate-400 block">
+                      ВЕРДИКТ (АО «ПОЛЁТ»):
+                    </span>
+                    <span className="text-xs font-black text-white uppercase">
+                      {report.executiveVerdict.decision === 'APPROVED' ? 'ДОПУСК В СЕРИЮ (ГОДНО)' :
+                       report.executiveVerdict.decision === 'CONDITIONAL' ? 'ДОПУСК С ДОРАБОТКОЙ В ЦЕХЕ' :
+                       'ЗАПРЕТ ЗАПУСКА (БРАК)'}
+                    </span>
+                  </div>
+                </div>
+                <div className="text-right font-mono font-black text-lg text-white">
+                  {report.executiveVerdict.overallScore}<span className="text-[10px] text-slate-400">/100</span>
+                </div>
+              </div>
+
+              {/* Метрики АВТОПИЛОТА */}
+              {report.autoPilotMetrics && (
+                <div className="grid grid-cols-2 gap-1.5 my-2 p-2 bg-slate-950/90 rounded-lg border border-cyan-500/20 text-[10px] font-mono">
+                  <div>
+                    <span className="text-slate-500 block text-[8px]">ТЕХПРОЦЕСС (АВТО):</span>
+                    <span className="text-slate-200 font-bold">{report.autoPilotMetrics.detectedProcessType}</span>
+                  </div>
+                  <div>
+                    <span className="text-slate-500 block text-[8px]">КВАЛИТЕТ ЕСДП (АВТО):</span>
+                    <span className="text-cyan-300 font-bold">{report.autoPilotMetrics.inferredAccuracyGrade}</span>
+                  </div>
+                  <div className="pt-1 border-t border-slate-800">
+                    <span className="text-slate-500 block text-[8px]">ПРОГНОЗ БРАКА:</span>
+                    <span className="text-amber-400 font-bold">{report.autoPilotMetrics.forecastDppm} DPPM</span>
+                  </div>
+                  <div className="pt-1 border-t border-slate-800">
+                    <span className="text-slate-500 block text-[8px]">ТАКТ КОНТРОЛЯ:</span>
+                    <span className="text-emerald-400 font-bold">{report.autoPilotMetrics.recommendedInspectionCycleSec} сек</span>
+                  </div>
+                </div>
+              )}
+
+              {/* Сводка дефектов */}
+              <div className="grid grid-cols-3 gap-1 my-1.5 pt-1.5 border-t border-slate-800 text-center font-mono text-[9px]">
+                <div className="bg-rose-950/40 border border-rose-800/60 p-1 rounded-lg text-rose-300">
+                  <span className="block text-slate-400 text-[8px]">Брак (списание):</span>
+                  <span className="font-bold text-[11px]">{report.executiveVerdict.unacceptableCount || 0}</span>
+                </div>
+                <div className="bg-amber-950/40 border border-amber-800/60 p-1 rounded-lg text-amber-300">
+                  <span className="block text-slate-400 text-[8px]">Исправимый:</span>
+                  <span className="font-bold text-[11px]">{report.executiveVerdict.conditionalCount || 0}</span>
+                </div>
+                <div className="bg-emerald-950/40 border border-emerald-800/60 p-1 rounded-lg text-emerald-300">
+                  <span className="block text-slate-400 text-[8px]">Допустимый брак:</span>
+                  <span className="font-bold text-[11px]">{report.executiveVerdict.acceptableCount || 0}</span>
+                </div>
+              </div>
+
+              {/* Обоснование допустимого брака */}
+              <div className="bg-slate-950 p-2 rounded-lg border border-slate-800 text-[10px] space-y-1 my-2">
+                <div className="flex items-center gap-1.5 text-cyan-400 font-bold">
+                  <ShieldCheck className="w-3.5 h-3.5" />
+                  Оценка технологических допусков:
+                </div>
+                <div className="text-slate-300 leading-snug">
+                  {report.executiveVerdict.toleranceAnalysisSummary}
+                </div>
+                <div className="text-emerald-400 font-mono text-[9px] pt-1 border-t border-slate-800">
+                  Указание цеху: {report.executiveVerdict.shopfloorDecision}
+                  {report.executiveVerdict.reworkEstimateMinutes > 0 && ` (~${report.executiveVerdict.reworkEstimateMinutes} мин)`}
+                </div>
+              </div>
+
+              <p className="text-[11px] text-slate-300 bg-slate-950 p-2.5 rounded-xl border border-slate-800 leading-relaxed whitespace-pre-line">
+                {report.executiveVerdict.summaryConclusion}
+              </p>
+            </div>
+
+            {/* Вкладки */}
+            <div className="flex rounded-xl bg-slate-900 p-1 border border-slate-800 text-[10px] font-bold overflow-x-auto scrollbar-none">
+              <button 
+                onClick={() => { triggerHaptic([10]); setActiveTab('verdict'); }}
+                className={`py-1.5 px-2.5 rounded-lg whitespace-nowrap ${activeTab === 'verdict' ? 'bg-cyan-500/10 text-cyan-400 border border-cyan-500/30' : 'text-slate-400'}`}
+              >
+                Дефекты ({report.detectedDefects?.length || 0})
+              </button>
+              <button 
+                onClick={() => { triggerHaptic([10]); setActiveTab('tolerance_map'); }}
+                className={`py-1.5 px-2.5 rounded-lg whitespace-nowrap ${activeTab === 'tolerance_map' ? 'bg-cyan-500/10 text-cyan-400 border border-cyan-500/30' : 'text-slate-400'}`}
+              >
+                Допустимый брак
+              </button>
+              <button 
+                onClick={() => { triggerHaptic([10]); setActiveTab('micro'); }}
+                className={`py-1.5 px-2.5 rounded-lg whitespace-nowrap ${activeTab === 'micro' ? 'bg-cyan-500/10 text-cyan-400 border border-cyan-500/30' : 'text-slate-400'}`}
+              >
+                Микропрофиль
+              </button>
+              <button 
+                onClick={() => { triggerHaptic([10]); setActiveTab('fmea'); }}
+                className={`py-1.5 px-2.5 rounded-lg whitespace-nowrap ${activeTab === 'fmea' ? 'bg-cyan-500/10 text-cyan-400 border border-cyan-500/30' : 'text-slate-400'}`}
+              >
+                FMEA-риски
+              </button>
+            </div>
+
+            {/* ВКЛАДКА 1: Дефекты */}
+            {activeTab === 'verdict' && (
+              <div className="flex flex-col gap-1.5">
+                <div className="flex gap-1 overflow-x-auto pb-0.5 text-[9px] font-mono">
+                  {[
+                    { id: 'all', label: 'Все' },
+                    { id: 'unacceptable', label: 'Недопустимые' },
+                    { id: 'conditional', label: 'Условные' },
+                    { id: 'acceptable', label: 'Допустимый брак' }
+                  ].map(btn => (
+                    <button
+                      key={btn.id}
+                      onClick={() => { triggerHaptic([10]); setDefectFilter(btn.id); }}
+                      className={`px-2 py-0.5 rounded-md border whitespace-nowrap transition ${
+                        defectFilter === btn.id 
+                          ? 'bg-slate-800 border-cyan-500 text-cyan-300 font-bold' 
+                          : 'bg-slate-900 border-slate-800 text-slate-400'
+                      }`}
+                    >
+                      {btn.label}
+                    </button>
+                  ))}
+                </div>
+
+                {filteredDefects.length === 0 ? (
+                  <div className="p-4 rounded-xl bg-slate-900 border border-slate-800 text-center text-xs text-slate-400">
+                    <Check className="w-5 h-5 text-emerald-400 mx-auto mb-1" />
+                    В выбранной категории отклонений не зафиксировано.
+                  </div>
+                ) : (
+                  filteredDefects.map((d, idx) => (
+                    <div 
+                      key={d.id} 
+                      onClick={() => focusOnDefect(d)}
+                      className={`bg-slate-900 border rounded-xl p-2.5 text-xs transition cursor-pointer ${
+                        selectedDefectId === d.id ? 'border-cyan-400 ring-2 ring-cyan-500/30 bg-slate-850' : 'border-slate-800'
+                      }`}
+                    >
+                      <div className="flex justify-between items-start mb-1">
+                        <span className="font-bold text-white flex items-center gap-1.5 text-[11px]">
+                          <span className="w-4 h-4 rounded-full bg-slate-800 text-cyan-400 border border-slate-700 flex items-center justify-center text-[9px] font-mono font-bold">
+                            {idx + 1}
+                          </span>
+                          <span className={`w-2 h-2 rounded-full ${d.admissibility === 'UNACCEPTABLE' ? 'bg-rose-500' : d.admissibility === 'CONDITIONAL' ? 'bg-amber-500' : 'bg-emerald-500'}`} />
+                          {d.defectName}
+                        </span>
+                        <div className="flex items-center gap-1.5">
+                          <span className="text-[9px] font-mono text-cyan-400 font-bold">{d.applicableGost}</span>
+                          <Focus className="w-3 h-3 text-slate-500 hover:text-cyan-400" />
+                        </div>
+                      </div>
+                      <div className="bg-slate-950 p-2 rounded-lg text-[10px] text-slate-300 space-y-0.5">
+                        <div><span className="text-slate-500 font-medium">Зона:</span> {d.exactLocation}</div>
+                        <div><span className="text-slate-500 font-medium">Признак:</span> {d.physicalMorphology}</div>
+                        <div><span className="text-amber-400 font-medium">Риск:</span> {d.failureRisk}</div>
+                        <div className="text-emerald-400 pt-0.5 border-t border-slate-800"><span className="font-bold">Цех:</span> {d.shopfloorAction}</div>
+                      </div>
+                    </div>
+                  ))
+                )}
+              </div>
+            )}
+
+            {/* ВКЛАДКА 2: Допустимый брак */}
+            {activeTab === 'tolerance_map' && (
+              <div className="flex flex-col gap-1.5">
+                <div className="bg-slate-900 border border-slate-800 rounded-xl p-2.5 text-xs text-slate-300 space-y-1">
+                  <span className="font-bold text-emerald-400 flex items-center gap-1.5 text-xs">
+                    <ThumbsUp className="w-4 h-4" />
+                    Карта технологических допусков (АО «Полёт»):
+                  </span>
+                  <p className="text-[10px] text-slate-400 leading-snug">
+                    Отклонения, разрешенные техническими условиями чертежа и стандартами ГОСТ 15467-79.
+                  </p>
+                </div>
+
+                {report.detectedDefects?.filter(d => d.isTolerableFlaw || d.admissibility === 'ACCEPTABLE').map((d, i) => (
+                  <div key={i} className="bg-slate-900 border border-emerald-500/30 rounded-xl p-2.5 text-xs space-y-1">
+                    <div className="flex justify-between items-center">
+                      <span className="font-bold text-slate-100 text-[11px]">{d.defectName}</span>
+                      <span className="text-[9px] font-mono text-emerald-400 font-bold bg-emerald-950/60 px-2 py-0.2 rounded border border-emerald-800">
+                        ДОПУСТИМО
+                      </span>
+                    </div>
+                    <div className="text-[10px] text-slate-300 bg-slate-950 p-2 rounded-lg leading-snug">
+                      <strong className="text-cyan-400 block mb-0.5 font-mono text-[9px]">Обоснование:</strong>
+                      {d.toleranceRationale}
+                    </div>
+                    <div className="text-[9px] font-mono text-slate-400">Локализация: {d.exactLocation}</div>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {/* ВКЛАДКА 3: Микропрофиль */}
+            {activeTab === 'micro' && (
+              <div className="bg-slate-900 border border-slate-800 rounded-xl p-3 text-xs space-y-2">
+                <span className="font-bold text-cyan-400 flex items-center gap-1.5 text-xs">
+                  <Gauge className="w-3.5 h-3.5" />
+                  Топография шероховатости (ГОСТ 2789-73):
+                </span>
+
+                <div className="grid grid-cols-2 gap-1.5 pt-1 border-t border-slate-800">
+                  <div className="bg-slate-950 p-2 rounded-lg">
+                    <span className="text-[8px] text-slate-500 block font-mono">Норма чертежа:</span>
+                    <span className="font-bold text-cyan-400 font-mono text-[11px]">{report.metrologicalPassport?.roughnessAudit?.drawingNorm}</span>
+                  </div>
+                  <div className="bg-slate-950 p-2 rounded-lg">
+                    <span className="text-[8px] text-slate-500 block font-mono">Измеренное Ra (факт):</span>
+                    <span className="font-bold text-amber-400 font-mono text-[11px]">{report.metrologicalPassport?.roughnessAudit?.measuredRaRange}</span>
+                  </div>
+                  <div className="bg-slate-950 p-2 rounded-lg">
+                    <span className="text-[8px] text-slate-500 block font-mono">Диапазон Rz:</span>
+                    <span className="font-mono text-slate-200 text-[10px]">{report.metrologicalPassport?.roughnessAudit?.estimatedRz}</span>
+                  </div>
+                  <div className="bg-slate-950 p-2 rounded-lg">
+                    <span className="text-[8px] text-slate-500 block font-mono">Шаг неровностей Sm:</span>
+                    <span className="font-mono text-slate-200 text-[10px]">{report.metrologicalPassport?.roughnessAudit?.stepSm || "0.08 - 0.25 мм"}</span>
+                  </div>
+                </div>
+
+                <div className="bg-slate-950 p-2 rounded-lg text-[10px] space-y-1">
+                  <div><span className="text-slate-500">Направление следов:</span> {report.metrologicalPassport?.roughnessAudit?.layDirection}</div>
+                  <div><span className="text-slate-500">Статус соответствия:</span> <span className="text-slate-200 font-semibold">{report.metrologicalPassport?.roughnessAudit?.complianceStatus}</span></div>
+                  <div><span className="text-slate-500">Базы (ГОСТ 21495):</span> {report.metrologicalPassport?.basesAndMatingSurfaces}</div>
+                  <div><span className="text-slate-500">Фаски (ГОСТ 2.307):</span> {report.metrologicalPassport?.edgesAndChamfers}</div>
+                </div>
+              </div>
+            )}
+
+            {/* ВКЛАДКА 4: FMEA-риски */}
+            {activeTab === 'fmea' && (
+              <div className="flex flex-col gap-1.5">
+                {report.fmeaOperationalRisks?.map((r, i) => (
+                  <div key={i} className="bg-slate-900 border border-slate-800 rounded-xl p-2.5 text-xs space-y-1">
+                    <div className="flex justify-between items-center">
+                      <span className="font-bold text-white text-[11px]">{r.riskFactor}</span>
+                      <span className={`text-[9px] font-mono font-bold px-1.5 py-0.2 rounded border ${
+                        r.riskLevel === 'КРИТИЧЕСКИЙ' ? 'bg-rose-950 text-rose-400 border-rose-800' :
+                        r.riskLevel === 'ВЫСОКИЙ' ? 'bg-orange-950 text-orange-400 border-orange-800' :
+                        r.riskLevel === 'УМЕРЕННЫЙ' ? 'bg-amber-950 text-amber-400 border-amber-800' :
+                        'bg-emerald-950 text-emerald-400 border-emerald-800'
+                      }`}>{r.riskLevel}</span>
+                    </div>
+                    <p className="text-[10px] text-slate-400 bg-slate-950 p-1.5 rounded-lg">{r.impactDescription}</p>
+                    <div className="text-[10px] text-emerald-300 bg-emerald-950/30 p-1.5 rounded border border-emerald-900/40">
+                      <strong className="text-emerald-400 block text-[9px]">Оценка допустимых отклонений:</strong>
+                      {r.toleratedEffect}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+
+          </div>
+        )}
+
+      </main>
+
+      {/* Закрепленная нижняя кнопка запуска под большой палец */}
+      <div className="fixed bottom-0 inset-x-0 max-w-[440px] mx-auto bg-slate-950/95 backdrop-blur-xl border-t border-slate-800/80 p-2.5 z-40">
+        <button
+          onClick={() => runDeepMetrologicalAudit()}
+          disabled={isAnalyzing}
+          className={`w-full py-3 px-4 rounded-xl font-black text-xs uppercase tracking-wider flex items-center justify-center gap-2 shadow-lg transition active:scale-[0.98] ${
+            isAnalyzing
+              ? 'bg-slate-800 text-slate-500 cursor-not-allowed border border-slate-700'
+              : isAutoMode
+              ? 'bg-gradient-to-r from-cyan-400 via-sky-400 to-blue-500 text-slate-950 shadow-cyan-500/25'
+              : 'bg-gradient-to-r from-slate-200 to-cyan-400 text-slate-950 shadow-cyan-500/20'
+          }`}
+        >
+          {isAnalyzing ? (
+            <>
+              <RefreshCw className="w-4 h-4 animate-spin text-slate-950" />
+              {isAutoMode ? "Автоопределение качества..." : "Прецизионный аудит..."}
+            </>
+          ) : (
+            <>
+              <Shield className="w-4 h-4 fill-slate-950" />
+              {report 
+                ? (isAutoMode ? "АВТО: ПОВТОРИТЬ ОЦЕНКУ" : "ПОВТОРИТЬ АУДИТ ПО ЧЕРТЕЖУ")
+                : (isAutoMode ? "ДИМАН АВТО: ОЦЕНИТЬ ДЕТАЛЬ" : "ДИМАН: ВЫНЕСТИ РЕШЕНИЕ ПО СЕРИИ")
+              }
+            </>
+          )}
+        </button>
+      </div>
+
+    </div>
+  );
+}
